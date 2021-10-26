@@ -1,0 +1,315 @@
+---
+jupyter:
+  jupytext:
+    formats: Rmd,ipynb
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.13.0
+  kernelspec:
+    display_name: R
+    language: R
+    name: ir
+---
+
+## Required R packages
+
+* `dplyr` for data management
+* `reticulate` to call Python code for fast calculation of distances between many points
+* `sf` to transform latitude and longitude into planar coordinates
+
+```{r load-packages, message=FALSE, warning=FALSE, results="hold"}
+library(dplyr)
+library(reticulate)
+library(sf)
+```
+and set the seed of the random number generator for reproducability.
+```{r set-seed}
+set.seed(24601)
+```
+
+## Required Python packages
+
+The Python 3 code calculating distances between many points requires
+
+* `numpy` for matrix operations
+* `numba` for just-in-time compilation for faster computation
+
+The Python code called from this R code is contained in the two files `dist_between_vectors.py` and `distance.py` which are included in the repository.
+
+## Load the simulated example data
+
+The data files included in the Github repository contain data
+simulated to resemble actual business locations in the San Francisco Bay Area.
+Neither locations nor visits are real.
+
+* dat_S.rds contains the locations of grocery stores
+* dat_A.rds contains the locations of (and foot-traffic to) nearby businesses of various industries
+
+```{r load-data}
+dat_S <- readRDS("data/dat_S.rds")
+dat_A <- readRDS("data/dat_A.rds")
+```
+
+
+## Calculate distances from businesses to grocery stores
+
+For (much) faster computation of the distances between the `r nrow(dat_A)` businesses and the `r nrow(dat_S)` grocery stores, we call Python code.
+First, make the Python code available in R.
+See the top of this document for the required Python packages.
+
+```{r source-python}
+source_python("dist_between_vectors.py")
+```
+Note that the function `dist_between` automatically omits from its ouput pairs of points that are far apart
+(not within a 2.5 mile square of each other).
+
+Next, calculate and save distances between businesses and grocery stores.
+```{r dist-AS}
+dat_D <- dist_between(as.matrix(dat_S %>% select(s_id,latitude,longitude)),
+                      as.matrix(dat_A %>% select(a_id,latitude,longitude)))
+colnames(dat_D) <- c("s_id","a_id","dist_m")
+dat_D <- as_tibble(dat_D) %>%
+  mutate(s_id = as.integer(s_id),
+         a_id = as.integer(a_id),
+         dist_m = as.integer(dist_m),
+         dist_km = dist_m / 1000,
+         dist_mi = dist_m*0.62137119223733/1000)
+saveRDS(dat_D,"data/dat_D.rds")
+```
+
+Similarly, calculate the distances between all grocery stores
+```{r dist-SS}
+dat_DS <- dist_between(as.matrix(dat_S %>% select(s_id,latitude,longitude)),
+                       as.matrix(dat_S %>% select(s_id,latitude,longitude)))
+colnames(dat_DS) <- c("s1_id","s2_id","dist_m")
+dat_DS <- as_tibble(dat_DS) %>%
+  mutate(s1_id = as.integer(s1_id),
+         s2_id = as.integer(s2_id),
+         dist_m = as.integer(dist_m),
+         dist_km = dist_m / 1000,
+         dist_mi = dist_m*0.62137119223733/1000) %>%
+  filter(s1_id != s2_id)
+saveRDS(dat_DS,"data/dat_DS.rds")
+```
+## Random points not near real grocery stores
+
+The neural network code looks for counterfactual treatment locations in the larger neighborhoods of pre-specified points.
+The first set of pre-specified points are the *real* treatment locations.
+However, to find counterfactual locations that are not close to real locations, we also draw (many) random locations.
+These random locations should be:
+
+1. near other businesses (because locations not near any businesses are implausible counterfactual locations anyway), 
+2. not near real grocery stores (because these are covered by the first set of pre-specified points), and
+3. not too close to one another (because the neural network searches the neighborhood of each point, we don't need the points to be close together)
+
+To achieve 1 and 2, start with the locations of other businesses that are not very close (<0.2 miles) but also not very far (>2 miles) from their respective *nearest* grocery store.
+```{r pick-isolated}
+dat_S_isolated <- dat_D %>%
+  # find distance to nearest grocery store
+  group_by(a_id) %>% 
+  summarize(dist_mi = min(dist_mi)) %>%
+  # keep in the relevant range
+  filter(between(dist_mi,0.2,2))
+```
+and move the points slightly around the business such that the center of an area does not point exactly at a different business
+```{r move-random}
+dat_S_isolated_random <- dat_S_isolated %>% 
+  inner_join(dat_A, by="a_id") %>% 
+  # randomly shift by approximately 0.025 - 0.05 miles to move away from business
+  # flip needed due to mean shift!
+  mutate(random_shock_lat = rnorm(n=n(),mean=0.0004,sd=0.0001),
+         random_shock_lon = rnorm(n=n(),mean=0.0004,sd=0.0001),
+         sign_flip_lat = (runif(n=n()) > 0.5)*2-1,
+         sign_flip_lon = (runif(n=n()) > 0.5)*2-1
+  ) %>% 
+  mutate(latitude=latitude+random_shock_lat*sign_flip_lat,
+         longitude=longitude+random_shock_lon*sign_flip_lon) %>% 
+  mutate(s_id = as.integer(1000 + row_number())) %>% 
+  select(s_id, latitude, longitude)
+```
+here, the random shocks are in degrees of latitude and longitude.
+When all observations are reasonably close to one another, this is fine because these random points are not used directly as counterfactual locations.
+When observations come from different regions that are far apart, the one degree of latitude / longitude may have signify different distances.
+In those cases, it may be better to, for instance, first project each point into 2D space.
+
+The random points here get `s_id` starting with 1,001.
+Because there are only `r nrow(dat_S)` real grocery store locations in the sample, this makes it easy to distinguish between real and random locations, and has no other meaning.
+
+To skip random points that are quite close to one another, and thereby do not help us explore different neighborhoods, we can check the distance between the random points.
+Whenever two random points are close (<100 meters) to one another, we drop one of the two.
+This again is not important conceptually, but may help computationally.
+```{r skip-close}
+tmp <- dist_between(as.matrix(dat_S_isolated_random),as.matrix(dat_S_isolated_random))
+colnames(tmp) <- c("s1_id","s2_id","dist_m")
+tmp <- as_tibble(tmp) %>% 
+  filter(s2_id < s1_id) %>% 
+  filter(dist_m < 100) %>% 
+  arrange(s2_id) %>% 
+  .$s2_id
+dat_S_candidate <- dat_S_isolated_random %>% filter(!(s_id %in% tmp))
+```
+
+Finally, save the remaining random points.
+```{r save-candidates}
+saveRDS(dat_S_candidate,"data/dat_S_candidate_random.rds")
+```
+
+Note that these random locations by themselves are NOT usually good counterfactual locations.
+The hope is that the neural network will discover some good counterfactual locations near some of the random locations.
+
+
+## Find 2D (grid) coordinates and save files for neural nets
+
+Project latitude and longitude into 2D space using the `sf` package, for real treatment locations, the random candidate locations, and the other businesses.
+```{r calc-2d-proj}
+# use NAD83(2011) projection, EPSG:6419 for California 3 zone (~ Bay Area)
+mat_S_xy <- cbind(dat_S$s_id,
+                  sf_project(from="WGS84", to="EPSG:6419",
+                             pts=cbind(dat_S$longitude,dat_S$latitude)))
+colnames(mat_S_xy) <- c("s_id","x","y")
+mat_S_candidate_xy <- cbind(dat_S_candidate$s_id,
+                            sf_project(from="WGS84", to="EPSG:6419",
+                                       pts=cbind(dat_S_candidate$longitude,
+                                                 dat_S_candidate$latitude)))
+colnames(mat_S_candidate_xy) <- c("s_id","x","y")
+mat_A_xy <- cbind(dat_A$a_id,
+                  sf_project(from="WGS84", to="EPSG:6419",
+                             pts=cbind(dat_A$longitude,dat_A$latitude)))
+colnames(mat_A_xy) <- c("a_id","x","y")
+# convert to tables instead of matrices for easier handling
+dat_S_xy <- as_tibble(mat_S_xy)
+dat_S_candidate_xy <- as_tibble(mat_S_candidate_xy)
+dat_A_xy <- as_tibble(mat_A_xy)
+```
+
+
+To simplify the setup of the neural network, for each real treatment or random location, save the locations of all nearby businesses as relative locations.
+```{r define-nearby}
+dist_keep_mi <-  2 * sqrt(2)  # * sqrt(2) fills a square with base 4 miles instead of a circle with diameter 4
+```
+
+First, for each real treatment location.
+```{r all-near-real}
+dat_S_A <- rbind(
+  # other businesses
+  dat_D %>% 
+    filter(dist_mi < dist_keep_mi) %>% 
+    select(s_id,a_id) %>%
+    # grid position of the grocery store
+    inner_join(dat_S_xy, by="s_id") %>% 
+    rename(x_s = x, y_s = y) %>% 
+    # grid position of other business
+    inner_join(dat_A_xy, by="a_id") %>%
+    # relative positions
+    mutate(x = x-x_s, y = y-y_s) %>% 
+    # industry of other business
+    inner_join(dat_A %>% select(a_id,naics_code), by="a_id") %>% 
+    select(s_id, a_id, x, y, naics_code),
+  # other treatment locations
+  dat_DS %>% 
+    filter(dist_mi < dist_keep_mi) %>% 
+    select(s1_id,s2_id) %>%
+    # grid position of the grocery store
+    inner_join(dat_S_xy, by=c("s1_id"="s_id")) %>% 
+    rename(x_s = x, y_s = y) %>% 
+    # grid position of other business
+    inner_join(dat_S_xy, by=c("s2_id"="s_id")) %>%
+    # relative positions
+    mutate(x = x-x_s, y = y-y_s) %>% 
+    # industry of other business
+    inner_join(dat_S %>% select(s_id,naics_code), by=c("s2_id"="s_id")) %>% 
+    mutate(s_id = s1_id, a_id = -s2_id) %>% 
+    select(s_id, a_id, x, y, naics_code) %>%
+    arrange(s_id)
+) %>% 
+  arrange(s_id) %>% 
+  mutate(x = round(x,2),
+         y = round(y,2))
+```
+
+
+Second, for the random points, we need the distances to other businesses and treatment locations.
+```{r distances-to-random}
+# distance to other businesses
+dat_D_candidate <- dist_between(as.matrix(dat_S_candidate),
+                                as.matrix(dat_A %>% select(a_id,latitude,longitude)))
+colnames(dat_D_candidate) <- c("s_id","a_id","dist_m")
+dat_D_candidate <- as_tibble(dat_D_candidate) %>% 
+  mutate(s_id = as.integer(s_id),
+         a_id = as.integer(a_id),
+         dist_mi = dist_m*0.62137119223733/1000)
+# distance to grocery stores
+dat_DS_candidate <- dist_between(as.matrix(dat_S_candidate),
+                                 as.matrix(dat_S %>% select(s_id,latitude,longitude)))
+colnames(dat_DS_candidate) <- c("s1_id","s2_id","dist_m")
+dat_DS_candidate <- as_tibble(dat_DS_candidate) %>% 
+  mutate(s_id = as.integer(s1_id),
+         a_id = as.integer(s2_id),
+         dist_mi = dist_m*0.62137119223733/1000)
+```
+
+Then we can gather all the relative distances for businesses near the random points in the same way as we did it for the real treatment locations.
+```{r all-near-random}
+dat_S_candidate_A <- rbind(
+  # other businesses
+  dat_D_candidate %>% 
+    filter(dist_mi < dist_keep_mi) %>% 
+    select(s_id,a_id) %>%
+    # grid position of the grocery store
+    inner_join(dat_S_candidate_xy, by="s_id") %>% 
+    rename(x_s = x, y_s = y) %>% 
+    # grid position of other business
+    inner_join(dat_A_xy, by="a_id") %>%
+    # relative positions
+    mutate(x = x-x_s, y = y-y_s) %>% 
+    # industry of other business
+    inner_join(dat_A %>% select(a_id,naics_code), by="a_id") %>% 
+    select(s_id, a_id, x, y, naics_code),
+  # real treatment locations
+  dat_DS_candidate %>% 
+    filter(dist_mi < dist_keep_mi) %>% 
+    select(s1_id,s2_id) %>%
+    # grid position of the grocery store
+    inner_join(dat_S_candidate_xy, by=c("s1_id"="s_id")) %>% 
+    rename(x_s = x, y_s = y) %>% 
+    # grid position of other business
+    inner_join(dat_S_xy, by=c("s2_id"="s_id")) %>%
+    # relative positions
+    mutate(x = x-x_s, y = y-y_s) %>% 
+    # industry of other business
+    inner_join(dat_S %>% select(s_id,naics_code), by=c("s2_id"="s_id")) %>% 
+    mutate(s_id = s1_id, a_id = -s2_id) %>% 
+    select(s_id, a_id, x, y, naics_code) %>%
+    arrange(s_id)
+) %>% 
+  arrange(s_id) %>% 
+  mutate(x = round(x,2),
+         y = round(y,2))
+```
+
+
+Finally, save the data as `.csv` files as input into the (Python) neural net.
+```{r save-csv}
+write.csv(x = dat_S_A %>% 
+            filter(floor(naics_code/100) != 4451) %>% 
+            select(s_id,a_id,x,y,naics_code),
+          file = "neural-net/grid_S_I.csv",
+          row.names=FALSE, quote=FALSE)
+write.csv(x = dat_S_A %>% 
+            filter(floor(naics_code/100) == 4451) %>% 
+            select(s_id,a_id,x,y),
+          file = "neural-net/grid_S_S.csv",
+          row.names=FALSE, quote=FALSE)
+write.csv(x = dat_S_candidate_A %>% 
+            filter(floor(naics_code/100) != 4451) %>% 
+            select(s_id,a_id,x,y,naics_code),
+          file = "neural-net/grid_S_random_I.csv",
+          row.names=FALSE, quote=FALSE)
+write.csv(x = dat_S_candidate_A %>% 
+            filter(floor(naics_code/100) == 4451) %>% 
+            select(s_id,a_id,x,y),
+          file = "neural-net/grid_S_random_S.csv",
+          row.names=FALSE, quote=FALSE)
+```
