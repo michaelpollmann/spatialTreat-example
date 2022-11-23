@@ -13,6 +13,9 @@ jupyter:
     name: ir
 ---
 
+# 01: Place Data in Grid
+
+
 ## Required R packages
 
 * `dplyr` for data management
