@@ -50,7 +50,7 @@ double calc_v (Rcpp::List M, int i, int s, int m, int a, double w, Rcpp::Numeric
     Rcpp::IntegerVector S1_in_S2 = Rcpp::match(S1,S2);
     Rcpp::NumericMatrix m2 = Mi2["m"];
     
-    Rcpp::DataFrame dat_w = Mi2["w"];
+    Rcpp::DataFrame dat_w = Rcpp::as<Rcpp::DataFrame>(Mi2["w"]);
     int nw2 = dat_w.nrow();
     Rcpp::NumericVector w2vec = dat_w["w"];
     Rcpp::NumericVector s2vec = dat_w["s"];
